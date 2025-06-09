@@ -25,16 +25,20 @@ from langchain_community.chat_message_histories import ChatMessageHistory  # Upd
 
 app = Flask(__name__)
 
-# CORS configuration
-CORS(app, resources={r"/*": {"origins": "*"}}, methods=['GET', 'POST', 'DELETE', 'OPTIONS'],
-     allow_headers=['Content-Type', 'Authorization'], supports_credentials=True)
+CORS(app, 
+     resources={r"/*": {"origins": ["https://chatwithdocuments.vercel.app", "http://localhost:5173"]}},
+     methods=['GET', 'POST', 'DELETE', 'OPTIONS'],
+     allow_headers=['Content-Type', 'Authorization'],
+     supports_credentials=False  # keep False if you don't send credentials
+)
 
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-    return response
+
+# @app.after_request
+# def after_request(response):
+#     response.headers.add('Access-Control-Allow-Origin', '*')
+#     response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+#     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+#     return response
 
 # Set OpenRouter API info
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
