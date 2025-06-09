@@ -17,19 +17,13 @@ from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
+from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain.schema import Document
 from langchain_openai import ChatOpenAI
 from langchain_huggingface import HuggingFaceEmbeddings
 
 app = Flask(__name__)
-
-# Enhanced CORS configuration
-CORS(app, 
-     resources={r"/*": {"origins": "*"}},
-     methods=['GET', 'POST', 'DELETE', 'OPTIONS'],
-     allow_headers=['Content-Type', 'Authorization'],
-     supports_credentials=True)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 @app.after_request
 def after_request(response):
@@ -38,7 +32,6 @@ def after_request(response):
     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     return response
 
-# Set environment variables for OpenRouter
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 os.environ["OPENAI_API_BASE"] = "https://openrouter.ai/api/v1"
 
@@ -48,13 +41,8 @@ class PDFChatSession:
         self.documents = []
         self.vectorstore = None
         self.chain = None
-        self.memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True,
-            output_key="answer"
-        )
         self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-        
+
     def add_pdf(self, pdf_content: bytes, filename: str) -> bool:
         try:
             pdf_reader = PdfReader(io.BytesIO(pdf_content))
@@ -63,17 +51,14 @@ class PDFChatSession:
                 page_text = page.extract_text()
                 if page_text:
                     text += f"\n[Page {page_num + 1}]\n{page_text}"
-            
+
             if not text.strip():
                 print(f"No text extracted from PDF: {filename}")
                 return False
 
-            doc = Document(
-                page_content=text,
-                metadata={"source": filename, "type": "pdf"}
-            )
+            doc = Document(page_content=text, metadata={"source": filename, "type": "pdf"})
             self.documents.append(doc)
-            print(f"Added document: {filename}, total documents: {len(self.documents)}")
+            print(f"Added document: {filename}, total documents: {len(self.documents)})")
             self._update_vectorstore()
             return True
         except Exception as e:
@@ -84,21 +69,12 @@ class PDFChatSession:
         if not self.documents:
             print("No documents to process")
             return
-            
+
         print(f"Updating vectorstore with {len(self.documents)} documents")
-        
-        # Split documents into smaller chunks
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50,
-            separators=["\n\n", "\n", " ", ""]
-        )
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         splits = text_splitter.split_documents(self.documents)
-        print(f"Created {len(splits)} text chunks")
-        
+
         try:
-            print("Setting up FAISS vectorstore...")
-            
             if self.vectorstore:
                 self.vectorstore.add_documents(splits)
                 print("Added documents to existing vectorstore")
@@ -106,9 +82,6 @@ class PDFChatSession:
                 self.vectorstore = FAISS.from_documents(splits, self.embeddings)
                 print("Created new FAISS vectorstore")
 
-            print("Setting up OpenRouter LLM...")
-            
-            # Use OpenRouter API with DeepSeek model (same as first code)
             llm = ChatOpenAI(
                 model_name="deepseek/deepseek-chat-v3-0324:free",
                 temperature=0.5,
@@ -116,90 +89,45 @@ class PDFChatSession:
                 openai_api_base=os.environ["OPENAI_API_BASE"],
                 openai_api_key=os.environ["OPENAI_API_KEY"]
             )
-            
-            self.chain = ConversationalRetrievalChain.from_llm(
+
+            base_chain = ConversationalRetrievalChain.from_llm(
                 llm=llm,
                 retriever=self.vectorstore.as_retriever(search_kwargs={"k": 3}),
-                memory=self.memory,
-                return_source_documents=True,
-                verbose=False
+                return_source_documents=True
             )
-            print("ConversationalRetrievalChain created successfully")
-                
+
+            self.chain = RunnableWithMessageHistory(
+                base_chain,
+                lambda session_id: InMemoryChatMessageHistory(),
+                input_messages_key="question",
+                history_messages_key="chat_history"
+            )
+            print("RunnableWithMessageHistory chain created successfully")
+
         except Exception as e:
             print(f"Error in _update_vectorstore: {str(e)}")
-            import traceback
-            traceback.print_exc()
             self.vectorstore = None
             self.chain = None
 
     def chat(self, question: str) -> Dict[str, Any]:
-        print(f"Chat called with question: {question}")
-        print(f"Chain exists: {self.chain is not None}")
-        print(f"Vectorstore exists: {self.vectorstore is not None}")
-        print(f"Number of documents: {len(self.documents)}")
-        
-        if not self.vectorstore:
-            if len(self.documents) == 0:
-                return {
-                    "answer": "Please upload at least one PDF document first.",
-                    "sources": []
-                }
-            else:
-                return {
-                    "answer": "There was an issue setting up the chat system. Please try uploading the document again.",
-                    "sources": []
-                }
+        if not self.chain or not self.vectorstore:
+            return {"answer": "Please upload a PDF document first.", "sources": []}
 
         try:
-            if self.chain:
-                # Use the invoke method
-                result = self.chain.invoke({"question": question})
-                sources = []
-
-                if "source_documents" in result:
-                    for doc in result["source_documents"]:
-                        sources.append({
-                            "content": doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content,
-                            "source": doc.metadata.get("source", "Unknown")
-                        })
-
-                return {
-                    "answer": result["answer"],
-                    "sources": sources
-                }
-            else:
-                # Fallback: Just do similarity search and return relevant chunks
-                docs = self.vectorstore.similarity_search(question, k=3)
-                
-                sources = []
-                answer_parts = []
-                
-                for doc in docs:
-                    sources.append({
-                        "content": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
-                        "source": doc.metadata.get("source", "Unknown")
-                    })
-                    answer_parts.append(doc.page_content[:300])
-                
-                # Create a simple answer from the retrieved documents
-                answer = f"Based on the documents, here are the most relevant sections for your question:\n\n"
-                for i, part in enumerate(answer_parts, 1):
-                    answer += f"{i}. {part[:200]}...\n\n"
-                
-                return {
-                    "answer": answer,
-                    "sources": sources
-                }
-
+            result = self.chain.invoke(
+                {"question": question},
+                config={"configurable": {"session_id": self.session_id}}
+            )
+            sources = []
+            for doc in result.get("source_documents", []):
+                sources.append({
+                    "content": doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content,
+                    "source": doc.metadata.get("source", "Unknown")
+                })
+            return {"answer": result["answer"], "sources": sources}
         except Exception as e:
             print(f"Error in chat: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return {
-                "answer": f"Error processing your question: {str(e)}",
-                "sources": []
-            }
+            return {"answer": f"Error: {str(e)}", "sources": []}
 
     def get_session_info(self) -> Dict[str, Any]:
         return {
@@ -210,146 +138,73 @@ class PDFChatSession:
             "document_names": [doc.metadata.get("source", "Unknown") for doc in self.documents]
         }
 
-# In-memory session store
 sessions: Dict[str, PDFChatSession] = {}
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        "status": "healthy",
-        "active_sessions": len(sessions),
-        "timestamp": datetime.now().isoformat()
-    })
-
-@app.route('/', methods=['GET'])
-def root():
-    return jsonify({'message': 'PDF Chat API with Sessions is running'}), 200
-
-@app.route('/create-session', methods=['POST', 'OPTIONS'])
+@app.route('/create-session', methods=['POST'])
 def create_session():
-    if request.method == 'OPTIONS':
-        return jsonify({'message': 'OK'}), 200
-        
     session_id = str(uuid.uuid4())
     sessions[session_id] = PDFChatSession(session_id)
-    print(f"Created session: {session_id}")
-    return jsonify({
-        "session_id": session_id,
-        "message": "Session created successfully"
-    })
+    return jsonify({"session_id": session_id})
 
-@app.route('/upload-pdf', methods=['POST', 'OPTIONS'])
+@app.route('/upload-pdf', methods=['POST'])
 def upload_pdf():
-    if request.method == 'OPTIONS':
-        return jsonify({'message': 'OK'}), 200
-        
     session_id = request.form.get('session_id')
-    print(f"Upload request for session: {session_id}")
-
     if not session_id or session_id not in sessions:
-        print(f"Invalid session ID: {session_id}")
         return jsonify({"error": "Invalid session ID"}), 400
 
     if 'pdf' not in request.files:
         return jsonify({"error": "No PDF file provided"}), 400
 
     pdf_file = request.files['pdf']
+    if pdf_file.filename == '' or not pdf_file.filename.lower().endswith('.pdf'):
+        return jsonify({"error": "Invalid PDF file"}), 400
 
-    if pdf_file.filename == '':
-        return jsonify({"error": "No file selected"}), 400
+    session = sessions[session_id]
+    success = session.add_pdf(pdf_file.read(), pdf_file.filename)
+    if not success:
+        return jsonify({"error": "Failed to process PDF"}), 400
 
-    if not pdf_file.filename.lower().endswith('.pdf'):
-        return jsonify({"error": "Only PDF files are allowed"}), 400
+    return jsonify({"message": "PDF uploaded", "session_info": session.get_session_info()})
 
-    try:
-        pdf_content = pdf_file.read()
-        session = sessions[session_id]
-        success = session.add_pdf(pdf_content, pdf_file.filename)
-
-        if success:
-            print(f"Successfully uploaded PDF: {pdf_file.filename}")
-            return jsonify({
-                "message": f"PDF '{pdf_file.filename}' uploaded and processed successfully",
-                "session_info": session.get_session_info()
-            })
-        else:
-            print(f"Failed to process PDF: {pdf_file.filename}")
-            return jsonify({"error": "Failed to process PDF"}), 400
-
-    except Exception as e:
-        print(f"Exception during upload: {str(e)}")
-        return jsonify({"error": f"Error uploading PDF: {str(e)}"}), 500
-
-@app.route('/chat', methods=['POST', 'OPTIONS'])
+@app.route('/chat', methods=['POST'])
 def chat():
-    if request.method == 'OPTIONS':
-        return jsonify({'message': 'OK'}), 200
-        
     data = request.get_json()
     session_id = data.get('session_id')
     question = data.get('question')
-    
-    print(f"Chat request - Session: {session_id}, Question: {question}")
 
     if not session_id or session_id not in sessions:
-        print(f"Invalid session ID in chat: {session_id}")
         return jsonify({"error": "Invalid session ID"}), 400
-
     if not question:
         return jsonify({"error": "Question is required"}), 400
 
     session = sessions[session_id]
-    result = session.chat(question)
-    return jsonify(result)
+    return jsonify(session.chat(question))
 
-@app.route('/session-info/<session_id>', methods=['GET', 'OPTIONS'])
+@app.route('/session-info/<session_id>', methods=['GET'])
 def get_session_info(session_id):
-    if request.method == 'OPTIONS':
-        return jsonify({'message': 'OK'}), 200
-        
     if session_id not in sessions:
         return jsonify({"error": "Session not found"}), 404
-    
-    session = sessions[session_id]
-    return jsonify(session.get_session_info())
+    return jsonify(sessions[session_id].get_session_info())
 
-@app.route('/clear-session/<session_id>', methods=['DELETE', 'OPTIONS'])
+@app.route('/clear-session/<session_id>', methods=['DELETE'])
 def clear_session(session_id):
-    if request.method == 'OPTIONS':
-        return jsonify({'message': 'OK'}), 200
-        
     if session_id in sessions:
         del sessions[session_id]
-        return jsonify({"message": "Session cleared successfully"})
-
+        return jsonify({"message": "Session cleared"})
     return jsonify({"error": "Session not found"}), 404
 
-@app.route('/list-sessions', methods=['GET', 'OPTIONS'])
+@app.route('/list-sessions', methods=['GET'])
 def list_sessions():
-    if request.method == 'OPTIONS':
-        return jsonify({'message': 'OK'}), 200
-        
-    session_list = []
-    for session_id, session in sessions.items():
-        session_list.append(session.get_session_info())
-    
     return jsonify({
-        "sessions": session_list,
+        "sessions": [s.get_session_info() for s in sessions.values()],
         "total_sessions": len(sessions)
     })
 
-# Error handlers
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({'error': 'Endpoint not found'}), 404
-
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({'error': 'Internal server error'}), 500
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "OK", "active_sessions": len(sessions)})
 
 if __name__ == '__main__':
-    print("Starting Flask PDF Chat Server with OpenRouter API...")
-    print("Using DeepSeek model via OpenRouter")
-    print(f"API Key configured: {'Yes' if os.getenv('OPENAI_API_KEY') else 'No'}")
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    print("Starting server...")
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
