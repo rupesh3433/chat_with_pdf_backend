@@ -29,10 +29,10 @@ CORS(app,
          r"/*": {
              "origins": "*",
              "methods": ['GET', 'POST', 'DELETE', 'OPTIONS'],
-             "allow_headers": ['Content-Type', 'Authorization']
+             "allow_headers": ['Content-Type', 'Authorization'],
          }
      },
-     supports_credentials=False
+     supports_credentials=True
 )
 
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
@@ -166,6 +166,9 @@ def root():
 
 @app.route('/create-session', methods=['POST'])
 def create_session():
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'OK'}), 200
+    
     try:
         session_id = str(uuid.uuid4())
         session = PDFChatSession(session_id)
