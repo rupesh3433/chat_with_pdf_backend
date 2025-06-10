@@ -25,9 +25,13 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 app = Flask(__name__)
 
 CORS(app, 
-     resources={r"/*": {"origins": ["https://chatwithdocuments.vercel.app", "http://localhost:5173"]}},
-     methods=['GET', 'POST', 'DELETE', 'OPTIONS'],
-     allow_headers=['Content-Type', 'Authorization'],
+     resources={
+         r"/*": {
+             "origins": "*",
+             "methods": ['GET', 'POST', 'DELETE', 'OPTIONS'],
+             "allow_headers": ['Content-Type', 'Authorization']
+         }
+     },
      supports_credentials=False
 )
 
