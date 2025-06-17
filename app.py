@@ -651,3 +651,5 @@ if __name__ == '__main__':
     logger.info(f"API Key configured: {os.environ.get('OPENAI_API_KEY', '').strip() not in ['', 'dummy-key']}")
     
     app.run(host='0.0.0.0', port=port, debug=debug_mode, threaded=True)
+
+    #API WORKING
