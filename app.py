@@ -2,25 +2,45 @@ from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 import io
 import os
+import sys
+import traceback
 from dotenv import load_dotenv
 from typing import List, Dict, Any
 import uuid
 from datetime import datetime
+import logging
+
+# Configure logging for production
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables from .env
 load_dotenv()
 
-# PDF processing
-from PyPDF2 import PdfReader
+try:
+    # PDF processing
+    from PyPDF2 import PdfReader
+    logger.info("PyPDF2 imported successfully")
+except ImportError as e:
+    logger.error(f"Failed to import PyPDF2: {e}")
+    sys.exit(1)
 
-# Updated LangChain imports
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain.chains import ConversationalRetrievalChain
-from langchain.schema import Document
-from langchain_openai import ChatOpenAI
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.chat_message_histories import ChatMessageHistory
+try:
+    # Updated LangChain imports
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from langchain_community.vectorstores import FAISS
+    from langchain.chains import ConversationalRetrievalChain
+    from langchain.schema import Document
+    from langchain_openai import ChatOpenAI
+    from langchain_huggingface import HuggingFaceEmbeddings
+    from langchain_community.chat_message_histories import ChatMessageHistory
+    logger.info("LangChain imports successful")
+except ImportError as e:
+    logger.error(f"Failed to import LangChain components: {e}")
+    # Continue without crashing - we'll handle this in the class
 
 app = Flask(__name__)
 
@@ -32,8 +52,18 @@ CORS(app,
      supports_credentials=False
 )
 
-os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
-os.environ["OPENAI_API_BASE"] = "https://openrouter.ai/api/v1"
+# Environment setup with error handling
+try:
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        logger.warning("OPENAI_API_KEY not found in environment variables")
+        openai_api_key = "dummy-key"  # Allow app to start even without key
+    
+    os.environ["OPENAI_API_KEY"] = openai_api_key
+    os.environ["OPENAI_API_BASE"] = "https://openrouter.ai/api/v1"
+    logger.info("Environment variables configured")
+except Exception as e:
+    logger.error(f"Error setting up environment: {e}")
 
 class PDFChatSession:
     def __init__(self, session_id: str):
@@ -42,18 +72,33 @@ class PDFChatSession:
         self.vectorstore = None
         self.chain = None
         self.chat_history = []
-        self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        self.embeddings = None
+        self._init_embeddings()
+
+    def _init_embeddings(self):
+        """Initialize embeddings with error handling"""
+        try:
+            self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+            logger.info("HuggingFace embeddings initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize embeddings: {e}")
+            self.embeddings = None
 
     def add_pdf(self, pdf_content: bytes, filename: str) -> bool:
         try:
             pdf_reader = PdfReader(io.BytesIO(pdf_content))
             text = ""
             for page_num, page in enumerate(pdf_reader.pages):
-                page_text = page.extract_text()
-                if page_text:
-                    text += f"\n[Page {page_num + 1}]\n{page_text}"
+                try:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += f"\n[Page {page_num + 1}]\n{page_text}"
+                except Exception as e:
+                    logger.warning(f"Failed to extract text from page {page_num + 1}: {e}")
+                    continue
 
             if not text.strip():
+                logger.warning(f"No text extracted from PDF: {filename}")
                 return False
 
             doc = Document(
@@ -62,49 +107,62 @@ class PDFChatSession:
             )
             self.documents.append(doc)
             self._update_vectorstore()
+            logger.info(f"Successfully processed PDF: {filename}")
             return True
 
         except Exception as e:
-            print(f"Error processing PDF {filename}: {str(e)}")
+            logger.error(f"Error processing PDF {filename}: {str(e)}")
             return False
 
     def _update_vectorstore(self):
-        if not self.documents:
+        if not self.documents or not self.embeddings:
+            logger.warning("Cannot update vectorstore: missing documents or embeddings")
             return
 
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=100,
-            separators=["\n\n", "\n", " ", ""]
-        )
-        splits = text_splitter.split_documents(self.documents)
-
         try:
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=100,
+                separators=["\n\n", "\n", " ", ""]
+            )
+            splits = text_splitter.split_documents(self.documents)
+            logger.info(f"Split documents into {len(splits)} chunks")
+
             if self.vectorstore:
                 self.vectorstore.add_documents(splits)
             else:
                 self.vectorstore = FAISS.from_documents(splits, self.embeddings)
 
-            llm = ChatOpenAI(
-                model_name="deepseek/deepseek-chat-v3-0324:free",
-                temperature=0.3,
-                max_tokens=1024,
-                openai_api_base=os.environ["OPENAI_API_BASE"],
-                openai_api_key=os.environ["OPENAI_API_KEY"]
-            )
+            # Only initialize LLM chain if we have API key
+            if os.environ.get("OPENAI_API_KEY") and os.environ["OPENAI_API_KEY"] != "dummy-key":
+                try:
+                    llm = ChatOpenAI(
+                        model_name="deepseek/deepseek-chat-v3-0324:free",
+                        temperature=0.3,
+                        max_tokens=1024,
+                        openai_api_base=os.environ["OPENAI_API_BASE"],
+                        openai_api_key=os.environ["OPENAI_API_KEY"]
+                    )
 
-            self.chain = ConversationalRetrievalChain.from_llm(
-                llm=llm,
-                retriever=self.vectorstore.as_retriever(
-                    search_type="similarity",
-                    search_kwargs={"k": 4}
-                ),
-                return_source_documents=True,
-                verbose=False
-            )
+                    self.chain = ConversationalRetrievalChain.from_llm(
+                        llm=llm,
+                        retriever=self.vectorstore.as_retriever(
+                            search_type="similarity",
+                            search_kwargs={"k": 4}
+                        ),
+                        return_source_documents=True,
+                        verbose=False
+                    )
+                    logger.info("LLM chain initialized successfully")
+                except Exception as e:
+                    logger.error(f"Failed to initialize LLM chain: {e}")
+                    self.chain = None
+            else:
+                logger.warning("No valid API key - running in basic mode")
+                self.chain = None
 
         except Exception as e:
-            print(f"Error in _update_vectorstore: {str(e)}")
+            logger.error(f"Error in _update_vectorstore: {str(e)}")
             self.vectorstore = None
             self.chain = None
 
@@ -126,15 +184,17 @@ class PDFChatSession:
                     sources.append({"content": content, "source": doc.metadata.get("source", "Unknown"), "type": doc.metadata.get("type", "unknown")})
                 return {"answer": result["answer"], "sources": sources}
             else:
+                # Fallback mode without LLM
                 docs = self.vectorstore.similarity_search(question, k=3)
                 sources = []
                 for doc in docs:
                     content = doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content
                     sources.append({"content": content, "source": doc.metadata.get("source", "Unknown"), "type": doc.metadata.get("type", "unknown")})
-                answer = "Here are the most relevant sections from your documents:\n\n" + "\n\n".join([f"{i+1}. From {src['source']}:\n{src['content']}" for i, src in enumerate(sources)])
+                answer = f"Here are the most relevant sections from your documents for '{question}':\n\n" + "\n\n".join([f"{i+1}. From {src['source']}:\n{src['content']}" for i, src in enumerate(sources)])
                 return {"answer": answer, "sources": sources}
 
         except Exception as e:
+            logger.error(f"Error in chat: {str(e)}")
             return {"answer": f"I encountered an error while processing your question: {str(e)}", "sources": []}
 
     def get_session_info(self) -> Dict[str, Any]:
@@ -164,33 +224,55 @@ def root():
 @app.route('/create-session', methods=['POST'])
 def create_session():
     try:
+        logger.info("Creating new session")
         session_id = str(uuid.uuid4())
         session = PDFChatSession(session_id)
         session.created_at = datetime.now().isoformat()
         sessions[session_id] = session
-        return jsonify({"session_id": session_id, "message": "Session created successfully", "created_at": session.created_at})
+        logger.info(f"Session created successfully: {session_id}")
+        return jsonify({
+            "session_id": session_id, 
+            "message": "Session created successfully", 
+            "created_at": session.created_at,
+            "has_embeddings": session.embeddings is not None,
+            "api_key_configured": os.environ.get("OPENAI_API_KEY", "").strip() not in ["", "dummy-key"]
+        })
     except Exception as e:
+        logger.error(f"Failed to create session: {str(e)}")
+        logger.error(traceback.format_exc())
         return jsonify({"error": f"Failed to create session: {str(e)}"}), 500
 
 @app.route('/upload-pdf', methods=['POST'])
 def upload_pdf():
-    session_id = request.form.get('session_id')
-    if not session_id or session_id not in sessions:
-        return jsonify({"error": "Invalid or expired session ID"}), 400
-    if 'pdf' not in request.files:
-        return jsonify({"error": "No PDF file provided"}), 400
-    pdf_file = request.files['pdf']
-    if not pdf_file.filename.lower().endswith('.pdf'):
-        return jsonify({"error": "Only PDF files are allowed"}), 400
     try:
+        session_id = request.form.get('session_id')
+        logger.info(f"PDF upload request for session: {session_id}")
+        
+        if not session_id or session_id not in sessions:
+            return jsonify({"error": "Invalid or expired session ID"}), 400
+        if 'pdf' not in request.files:
+            return jsonify({"error": "No PDF file provided"}), 400
+        
+        pdf_file = request.files['pdf']
+        if not pdf_file.filename.lower().endswith('.pdf'):
+            return jsonify({"error": "Only PDF files are allowed"}), 400
+        
         pdf_content = pdf_file.read()
         session = sessions[session_id]
         success = session.add_pdf(pdf_content, pdf_file.filename)
+        
         if success:
-            return jsonify({"message": f"PDF '{pdf_file.filename}' uploaded and processed successfully", "session_info": session.get_session_info()})
+            logger.info(f"PDF uploaded successfully: {pdf_file.filename}")
+            return jsonify({
+                "message": f"PDF '{pdf_file.filename}' uploaded and processed successfully", 
+                "session_info": session.get_session_info()
+            })
         else:
             return jsonify({"error": "Failed to process PDF - no text could be extracted"}), 400
+            
     except Exception as e:
+        logger.error(f"Error uploading PDF: {str(e)}")
+        logger.error(traceback.format_exc())
         return jsonify({"error": f"Error uploading PDF: {str(e)}"}), 500
 
 @app.route('/chat', methods=['POST'])
@@ -244,9 +326,26 @@ def internal_error(error):
     return response, 500
 
 if __name__ == '__main__':
-    print("Starting Flask PDF Chat Server with OpenRouter API...")
+    logger.info("Starting Flask PDF Chat Server with OpenRouter API...")
+    
+    # Check dependencies
+    missing_deps = []
+    try:
+        import langchain
+        import faiss
+    except ImportError as e:
+        missing_deps.append(str(e))
+    
+    if missing_deps:
+        logger.warning(f"Some dependencies are missing: {missing_deps}")
+        logger.warning("App will run in limited mode")
+    
     # Use environment variable for port, defaulting to 5000
     port = int(os.environ.get('PORT', 5000))
     # In production, debug should be False
     debug_mode = os.environ.get('FLASK_ENV') == 'development'
+    
+    logger.info(f"Starting server on port {port}, debug={debug_mode}")
+    logger.info(f"API Key configured: {os.environ.get('OPENAI_API_KEY', '').strip() not in ['', 'dummy-key']}")
+    
     app.run(host='0.0.0.0', port=port, debug=debug_mode)
