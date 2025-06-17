@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify, make_response
-from flask_cors import CORS
+from flask_cors import CORS, cross_origin
 import io
 import os
 import sys
@@ -46,9 +46,20 @@ app = Flask(__name__)
 
 # Simplified CORS configuration to avoid duplicate headers
 CORS(app, 
-     origins="*",
+     origins=[
+         "https://chatwithdocuments.vercel.app",
+         "http://localhost:3000",
+         "http://localhost:5173",
+         "http://127.0.0.1:5000"
+     ],
      methods=['GET', 'POST', 'DELETE', 'OPTIONS', 'PUT', 'PATCH'],
-     allow_headers=['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+     allow_headers=[
+         'Content-Type', 
+         'Authorization', 
+         'X-Requested-With', 
+         'Accept', 
+         'Origin'
+     ],
      supports_credentials=False
 )
 
@@ -73,12 +84,16 @@ class PDFChatSession:
         self.chain = None
         self.chat_history = []
         self.embeddings = None
+        self.created_at = datetime.now().isoformat()
         self._init_embeddings()
 
     def _init_embeddings(self):
         """Initialize embeddings with error handling"""
         try:
-            self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name="all-MiniLM-L6-v2",
+                model_kwargs={'device': 'cpu'}
+            )
             logger.info("HuggingFace embeddings initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize embeddings: {e}")
@@ -103,7 +118,12 @@ class PDFChatSession:
 
             doc = Document(
                 page_content=text,
-                metadata={"source": filename, "type": "pdf", "timestamp": datetime.now().isoformat()}
+                metadata={
+                    "source": filename, 
+                    "type": "pdf", 
+                    "timestamp": datetime.now().isoformat(),
+                    "page_count": len(pdf_reader.pages)
+                }
             )
             self.documents.append(doc)
             self._update_vectorstore()
@@ -169,33 +189,71 @@ class PDFChatSession:
     def chat(self, question: str) -> Dict[str, Any]:
         if not self.vectorstore:
             if not self.documents:
-                return {"answer": "Please upload at least one PDF document to start chatting.", "sources": []}
-            return {"answer": "Vectorstore setup failed. Please try re-uploading your documents.", "sources": []}
+                return {
+                    "answer": "Please upload at least one PDF document to start chatting.", 
+                    "sources": [],
+                    "error": "no_documents"
+                }
+            return {
+                "answer": "Vectorstore setup failed. Please try re-uploading your documents.", 
+                "sources": [],
+                "error": "vectorstore_failed"
+            }
 
         try:
             if self.chain:
-                result = self.chain.invoke({"question": question, "chat_history": self.chat_history})
+                result = self.chain.invoke({
+                    "question": question, 
+                    "chat_history": self.chat_history
+                })
+                
                 self.chat_history.append((question, result["answer"]))
                 if len(self.chat_history) > 10:
                     self.chat_history = self.chat_history[-10:]
+                
                 sources = []
                 for doc in result.get("source_documents", []):
                     content = doc.page_content[:400] + "..." if len(doc.page_content) > 400 else doc.page_content
-                    sources.append({"content": content, "source": doc.metadata.get("source", "Unknown"), "type": doc.metadata.get("type", "unknown")})
-                return {"answer": result["answer"], "sources": sources}
+                    sources.append({
+                        "content": content,
+                        "source": doc.metadata.get("source", "Unknown"),
+                        "type": doc.metadata.get("type", "unknown"),
+                        "page_count": doc.metadata.get("page_count", "Unknown")
+                    })
+                
+                return {
+                    "answer": result["answer"], 
+                    "sources": sources,
+                    "mode": "ai_enhanced"
+                }
             else:
                 # Fallback mode without LLM
                 docs = self.vectorstore.similarity_search(question, k=3)
                 sources = []
                 for doc in docs:
                     content = doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content
-                    sources.append({"content": content, "source": doc.metadata.get("source", "Unknown"), "type": doc.metadata.get("type", "unknown")})
-                answer = f"Here are the most relevant sections from your documents for '{question}':\n\n" + "\n\n".join([f"{i+1}. From {src['source']}:\n{src['content']}" for i, src in enumerate(sources)])
-                return {"answer": answer, "sources": sources}
+                    sources.append({
+                        "content": content,
+                        "source": doc.metadata.get("source", "Unknown"),
+                        "type": doc.metadata.get("type", "unknown")
+                    })
+                
+                answer = f"Here are the most relevant sections from your documents for '{question}':\n\n" + \
+                        "\n\n".join([f"{i+1}. From {src['source']}:\n{src['content']}" for i, src in enumerate(sources)])
+                
+                return {
+                    "answer": answer, 
+                    "sources": sources,
+                    "mode": "basic_search"
+                }
 
         except Exception as e:
             logger.error(f"Error in chat: {str(e)}")
-            return {"answer": f"I encountered an error while processing your question: {str(e)}", "sources": []}
+            return {
+                "answer": f"I encountered an error while processing your question: {str(e)}", 
+                "sources": [],
+                "error": "processing_error"
+            }
 
     def get_session_info(self) -> Dict[str, Any]:
         return {
@@ -205,59 +263,113 @@ class PDFChatSession:
             "has_chain": self.chain is not None,
             "document_names": [doc.metadata.get("source", "Unknown") for doc in self.documents],
             "chat_history_length": len(self.chat_history),
-            "created_at": getattr(self, 'created_at', datetime.now().isoformat())
+            "created_at": self.created_at,
+            "last_activity": datetime.now().isoformat()
         }
 
     def clear_memory(self):
         self.chat_history = []
+        logger.info(f"Memory cleared for session: {self.session_id}")
 
+# Global sessions dictionary
 sessions: Dict[str, PDFChatSession] = {}
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({"status": "healthy", "active_sessions": len(sessions), "timestamp": datetime.now().isoformat(), "version": "2.0"})
+    return jsonify({
+        "status": "healthy", 
+        "active_sessions": len(sessions), 
+        "timestamp": datetime.now().isoformat(), 
+        "version": "2.1",
+        "environment": "production"
+    })
 
 @app.route('/', methods=['GET'])
 def root():
-    return jsonify({'message': 'PDF Chat API with Sessions is running', 'version': '2.0', 'endpoints': ['/create-session', '/upload-pdf', '/chat', '/session-info', '/clear-session', '/list-sessions']}), 200
+    return jsonify({
+        'message': 'PDF Chat API with Sessions is running', 
+        'version': '2.1', 
+        'status': 'active',
+        'endpoints': {
+            'create_session': '/create-session',
+            'upload_pdf': '/upload-pdf',
+            'chat': '/chat',
+            'session_info': '/session-info/<session_id>',
+            'clear_session': '/clear-session/<session_id>',
+            'clear_memory': '/clear-memory/<session_id>',
+            'list_sessions': '/list-sessions',
+            'health': '/health'
+        }
+    }), 200
 
 @app.route('/create-session', methods=['POST'])
-def create_session():
+def create_session():        
     try:
         logger.info("Creating new session")
         session_id = str(uuid.uuid4())
         session = PDFChatSession(session_id)
-        session.created_at = datetime.now().isoformat()
         sessions[session_id] = session
+        
         logger.info(f"Session created successfully: {session_id}")
-        return jsonify({
+        
+        response_data = {
             "session_id": session_id, 
             "message": "Session created successfully", 
             "created_at": session.created_at,
             "has_embeddings": session.embeddings is not None,
-            "api_key_configured": os.environ.get("OPENAI_API_KEY", "").strip() not in ["", "dummy-key"]
-        })
+            "api_key_configured": os.environ.get("OPENAI_API_KEY", "").strip() not in ["", "dummy-key"],
+            "status": "ready"
+        }
+        
+        return jsonify(response_data), 200
+        
     except Exception as e:
         logger.error(f"Failed to create session: {str(e)}")
         logger.error(traceback.format_exc())
-        return jsonify({"error": f"Failed to create session: {str(e)}"}), 500
+        return jsonify({
+            "error": f"Failed to create session: {str(e)}",
+            "error_type": "session_creation_failed"
+        }), 500
 
 @app.route('/upload-pdf', methods=['POST'])
-def upload_pdf():
+def upload_pdf():        
     try:
         session_id = request.form.get('session_id')
         logger.info(f"PDF upload request for session: {session_id}")
         
         if not session_id or session_id not in sessions:
-            return jsonify({"error": "Invalid or expired session ID"}), 400
+            return jsonify({
+                "error": "Invalid or expired session ID",
+                "error_type": "invalid_session"
+            }), 400
+            
         if 'pdf' not in request.files:
-            return jsonify({"error": "No PDF file provided"}), 400
+            return jsonify({
+                "error": "No PDF file provided",
+                "error_type": "no_file"
+            }), 400
         
         pdf_file = request.files['pdf']
+        if not pdf_file.filename:
+            return jsonify({
+                "error": "No file selected",
+                "error_type": "no_file_selected"
+            }), 400
+            
         if not pdf_file.filename.lower().endswith('.pdf'):
-            return jsonify({"error": "Only PDF files are allowed"}), 400
+            return jsonify({
+                "error": "Only PDF files are allowed",
+                "error_type": "invalid_file_type"
+            }), 400
         
+        # Check file size (limit to 10MB)
         pdf_content = pdf_file.read()
+        if len(pdf_content) > 10 * 1024 * 1024:  # 10MB
+            return jsonify({
+                "error": "File too large. Maximum size is 10MB.",
+                "error_type": "file_too_large"
+            }), 400
+        
         session = sessions[session_id]
         success = session.add_pdf(pdf_content, pdf_file.filename)
         
@@ -265,65 +377,133 @@ def upload_pdf():
             logger.info(f"PDF uploaded successfully: {pdf_file.filename}")
             return jsonify({
                 "message": f"PDF '{pdf_file.filename}' uploaded and processed successfully", 
-                "session_info": session.get_session_info()
-            })
+                "session_info": session.get_session_info(),
+                "status": "success"
+            }), 200
         else:
-            return jsonify({"error": "Failed to process PDF - no text could be extracted"}), 400
+            return jsonify({
+                "error": "Failed to process PDF - no text could be extracted",
+                "error_type": "pdf_processing_failed"
+            }), 400
             
     except Exception as e:
         logger.error(f"Error uploading PDF: {str(e)}")
         logger.error(traceback.format_exc())
-        return jsonify({"error": f"Error uploading PDF: {str(e)}"}), 500
+        return jsonify({
+            "error": f"Error uploading PDF: {str(e)}",
+            "error_type": "upload_error"
+        }), 500
 
 @app.route('/chat', methods=['POST'])
-def chat():
+def chat():        
     try:
         data = request.get_json()
+        if not data:
+            return jsonify({
+                "error": "No JSON data provided",
+                "error_type": "no_data"
+            }), 400
+            
         session_id = data.get('session_id')
         question = data.get('question', '').strip()
+        
         if not session_id or session_id not in sessions:
-            return jsonify({"error": "Invalid or expired session ID"}), 400
+            return jsonify({
+                "error": "Invalid or expired session ID",
+                "error_type": "invalid_session"
+            }), 400
+            
         if not question:
-            return jsonify({"error": "Question is required and cannot be empty"}), 400
+            return jsonify({
+                "error": "Question is required and cannot be empty",
+                "error_type": "empty_question"
+            }), 400
+        
         session = sessions[session_id]
-        return jsonify(session.chat(question))
+        result = session.chat(question)
+        
+        return jsonify(result), 200
+        
     except Exception as e:
-        return jsonify({"error": f"Error processing chat: {str(e)}"}), 500
+        logger.error(f"Error processing chat: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({
+            "error": f"Error processing chat: {str(e)}",
+            "error_type": "chat_error"
+        }), 500
 
 @app.route('/session-info/<session_id>', methods=['GET'])
-def get_session_info(session_id):
+def get_session_info(session_id):        
     if session_id not in sessions:
-        return jsonify({"error": "Session not found"}), 404
-    return jsonify(sessions[session_id].get_session_info())
+        return jsonify({
+            "error": "Session not found",
+            "error_type": "session_not_found"
+        }), 404
+        
+    return jsonify(sessions[session_id].get_session_info()), 200
 
 @app.route('/clear-session/<session_id>', methods=['DELETE'])
-def clear_session(session_id):
+def clear_session(session_id):        
     if session_id in sessions:
         del sessions[session_id]
-        return jsonify({"message": "Session cleared successfully"})
-    return jsonify({"error": "Session not found"}), 404
+        logger.info(f"Session cleared: {session_id}")
+        return jsonify({
+            "message": "Session cleared successfully",
+            "status": "success"
+        }), 200
+    return jsonify({
+        "error": "Session not found",
+        "error_type": "session_not_found"
+    }), 404
 
 @app.route('/clear-memory/<session_id>', methods=['POST'])
-def clear_memory(session_id):
+def clear_memory(session_id):        
     if session_id not in sessions:
-        return jsonify({"error": "Session not found"}), 404
+        return jsonify({
+            "error": "Session not found",
+            "error_type": "session_not_found"
+        }), 404
+        
     sessions[session_id].clear_memory()
-    return jsonify({"message": "Session memory cleared successfully"})
+    return jsonify({
+        "message": "Session memory cleared successfully",
+        "status": "success"
+    }), 200
 
 @app.route('/list-sessions', methods=['GET'])
-def list_sessions():
+def list_sessions():        
     session_list = [session.get_session_info() for session in sessions.values()]
-    return jsonify({"sessions": session_list, "total_sessions": len(sessions)})
+    return jsonify({
+        "sessions": session_list, 
+        "total_sessions": len(sessions),
+        "timestamp": datetime.now().isoformat()
+    }), 200
 
 @app.errorhandler(404)
 def not_found(error):
-    response = jsonify({'error': 'Endpoint not found'})
+    response = jsonify({
+        'error': 'Endpoint not found',
+        'error_type': 'not_found',
+        'available_endpoints': ['/health', '/create-session', '/upload-pdf', '/chat']
+    })
     return response, 404
 
 @app.errorhandler(500)
 def internal_error(error):
-    response = jsonify({'error': 'Internal server error'})
+    logger.error(f"Internal server error: {str(error)}")
+    response = jsonify({
+        'error': 'Internal server error',
+        'error_type': 'internal_error'
+    })
     return response, 500
+
+@app.errorhandler(405)
+def method_not_allowed(error):
+    response = jsonify({
+        'error': 'Method not allowed',
+        'error_type': 'method_not_allowed'
+    })
+    return response, 405
 
 if __name__ == '__main__':
     logger.info("Starting Flask PDF Chat Server with OpenRouter API...")
@@ -343,9 +523,9 @@ if __name__ == '__main__':
     # Use environment variable for port, defaulting to 5000
     port = int(os.environ.get('PORT', 5000))
     # In production, debug should be False
-    debug_mode = os.environ.get('FLASK_ENV') == 'development'
+    debug_mode = os.environ.get('FLASK_ENV', 'production') == 'development'
     
     logger.info(f"Starting server on port {port}, debug={debug_mode}")
     logger.info(f"API Key configured: {os.environ.get('OPENAI_API_KEY', '').strip() not in ['', 'dummy-key']}")
     
-    app.run(host='0.0.0.0', port=port, debug=debug_mode)
+    app.run(host='0.0.0.0', port=port, debug=debug_mode, threaded=True)
