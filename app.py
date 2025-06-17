@@ -24,15 +24,12 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 
 app = Flask(__name__)
 
+# Simplified CORS configuration to avoid duplicate headers
 CORS(app, 
-     resources={
-         r"/*": {
-             "origins": "*",
-             "methods": ['GET', 'POST', 'DELETE', 'OPTIONS'],
-             "allow_headers": ['Content-Type', 'Authorization'],
-         }
-     },
-     supports_credentials=True
+     origins="*",
+     methods=['GET', 'POST', 'DELETE', 'OPTIONS', 'PUT', 'PATCH'],
+     allow_headers=['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+     supports_credentials=False
 )
 
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
@@ -166,9 +163,6 @@ def root():
 
 @app.route('/create-session', methods=['POST'])
 def create_session():
-    if request.method == 'OPTIONS':
-        return jsonify({'status': 'OK'}), 200
-    
     try:
         session_id = str(uuid.uuid4())
         session = PDFChatSession(session_id)
@@ -241,13 +235,18 @@ def list_sessions():
 
 @app.errorhandler(404)
 def not_found(error):
-    return jsonify({'error': 'Endpoint not found'}), 404
+    response = jsonify({'error': 'Endpoint not found'})
+    return response, 404
 
 @app.errorhandler(500)
 def internal_error(error):
-    return jsonify({'error': 'Internal server error'}), 500
+    response = jsonify({'error': 'Internal server error'})
+    return response, 500
 
 if __name__ == '__main__':
     print("Starting Flask PDF Chat Server with OpenRouter API...")
+    # Use environment variable for port, defaulting to 5000
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    # In production, debug should be False
+    debug_mode = os.environ.get('FLASK_ENV') == 'development'
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)
