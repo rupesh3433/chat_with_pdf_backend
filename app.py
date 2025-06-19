@@ -81,32 +81,49 @@ try:
 except Exception as e:
     logger.error(f"Error setting up environment: {e}")
 
+# Update the imports section
+from functools import lru_cache
+import threading
+
+# Replace the get_embeddings() function with this optimized version:
+embedding_lock = threading.Lock()
+
+@lru_cache(maxsize=1)
 def get_embeddings():
-    """Get embeddings instance with lazy initialization and memory management"""
-    global global_embeddings
+    """Get embeddings instance with thread-safe lazy initialization"""
+    logger.info("Initializing embeddings model...")
+    start_time = time.time()
     
-    if global_embeddings is None:
-        logger.info("Initializing embeddings model...")
-        start_time = time.time()
+    try:
+        # Use smaller model for better performance
+        model_name = "sentence-transformers/all-MiniLM-L6-v2"
         
-        try:
-            # Use more memory-efficient initialization
-            global_embeddings = HFEmbeddings(
-                model_name=EMBEDDINGS_MODEL,
-                model_kwargs={'device': 'cpu'},
-                encode_kwargs={'normalize_embeddings': True}
+        # Configuration for low-memory environments
+        model_kwargs = {'device': 'cpu'}
+        encode_kwargs = {
+            'normalize_embeddings': True,
+            'batch_size': 8  # Reduced from default to save memory
+        }
+        
+        # Thread-safe initialization
+        with embedding_lock:
+            embeddings = HFEmbeddings(
+                model_name=model_name,
+                model_kwargs=model_kwargs,
+                encode_kwargs=encode_kwargs
             )
             
-            # Test with small input to force initialization
-            global_embeddings.embed_query("test")
+            # Warm-up with small batch
+            embeddings.embed_documents(["warmup"])
             
             load_time = time.time() - start_time
             logger.info(f"Embeddings initialized in {load_time:.2f} seconds")
-        except Exception as e:
-            logger.error(f"Embeddings initialization failed: {str(e)}")
-            global_embeddings = None
-    
-    return global_embeddings
+            
+            return embeddings
+            
+    except Exception as e:
+        logger.error(f"Embeddings initialization failed: {str(e)}")
+        raise RuntimeError("Failed to initialize embeddings") from e
 
 class PDFChatSession:
     def __init__(self, session_id: str):
@@ -120,39 +137,50 @@ class PDFChatSession:
     def add_pdf(self, pdf_content: bytes, filename: str) -> bool:
         try:
             logger.info(f"Processing PDF: {filename}")
-            pdf_reader = PdfReader(io.BytesIO(pdf_content))
-            text = ""
-            for page_num, page in enumerate(pdf_reader.pages):
-                try:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text += f"\n[Page {page_num + 1}]\n{page_text}"
-                except Exception as e:
-                    logger.warning(f"Failed to extract text from page {page_num + 1}: {e}")
-                    continue
+            
+            # Use incremental processing to save memory
+            text_parts = []
+            with io.BytesIO(pdf_content) as pdf_stream:
+                pdf_reader = PdfReader(pdf_stream)
+                
+                for page_num in range(len(pdf_reader.pages)):
+                    try:
+                        page = pdf_reader.pages[page_num]
+                        page_text = page.extract_text() or ""
+                        text_parts.append(f"\n[Page {page_num + 1}]\n{page_text}")
+                    except Exception as e:
+                        logger.warning(f"Page {page_num + 1} error: {e}")
+                        continue
 
-            if not text.strip():
+            full_text = "".join(text_parts)
+            
+            if not full_text.strip():
                 logger.warning(f"No text extracted from PDF: {filename}")
                 return False
 
+            # Process in chunks to avoid memory spikes
             doc = Document(
-                page_content=text,
+                page_content=full_text,
                 metadata={
-                    "source": filename, 
-                    "type": "pdf", 
+                    "source": filename,
+                    "type": "pdf",
                     "timestamp": datetime.now().isoformat(),
                     "page_count": len(pdf_reader.pages)
                 }
             )
+            
             self.documents.append(doc)
-            self._update_vectorstore()
-            logger.info(f"Successfully processed PDF: {filename}")
+            
+            # Defer vectorstore update to first query if many PDFs
+            if len(self.documents) <= 3:  # Update immediately for small batches
+                self._update_vectorstore()
+                
             return True
 
         except Exception as e:
-            logger.error(f"Error processing PDF {filename}: {str(e)}")
+            logger.error(f"PDF processing error: {str(e)}")
             return False
-
+    
     def _update_vectorstore(self):
         if not self.documents:
             logger.warning("Cannot update vectorstore: no documents")
